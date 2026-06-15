@@ -1,0 +1,31 @@
+services:
+  edge-vision:
+    build: .
+    ports:
+      - "3000:3000"
+    devices:
+      - "/dev/video0:/dev/video0"
+      - "/dev/video1:/dev/video1"
+    privileged: true
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      CAMERA_SOURCE: /dev/video0
+      CAMERA_WIDTH: 1280
+      CAMERA_HEIGHT: 720
+      CAMERA_FPS: 15
+      YOLO_MODEL: /models/yolov8s_performance.rknn
+      YOLO_CONFIDENCE: 0.55
+      YOLO_IOU: 0.50
+      YOLO_IMAGE_SIZE: 640
+      BBOX_OPACITY: 0.35
+      SAHI_ENABLED: "false"
+      ALPR_ENABLED: "false"
+      MODELS_DIR: /models
+      DATA_DIR: /data
+      FACES_DIR: /data/faces
+      FACE_MATCH_THRESHOLD: 0.35
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    restart: unless-stopped
