@@ -40,7 +40,7 @@ class Settings:
     camera_height: int = _to_int(os.getenv("CAMERA_HEIGHT"), 720)
     camera_fps: int = _to_int(os.getenv("CAMERA_FPS"), 15)
     yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
-    yolo_confidence: float = _to_float(os.getenv("YOLO_CONFIDENCE"), 0.55)
+    yolo_confidence: float = _to_float(os.getenv("YOLO_CONFIDENCE"), 0.35)
     yolo_iou: float = _to_float(os.getenv("YOLO_IOU"), 0.50)
     yolo_image_size: int = _to_int(os.getenv("YOLO_IMAGE_SIZE"), 640)
     bbox_opacity: float = _to_float(os.getenv("BBOX_OPACITY"), 0.35)

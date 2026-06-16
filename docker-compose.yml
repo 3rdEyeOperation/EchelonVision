@@ -10,6 +10,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 3000
+      MODEL_IMPORT_DIR: /model-import
       CAMERA_SOURCE: /dev/video0
       CAMERA_WIDTH: 1280
       CAMERA_HEIGHT: 720
@@ -28,4 +29,5 @@ services:
     volumes:
       - ./data:/data
       - ./models:/models
+      - ./model-import:/model-import:ro
     restart: unless-stopped

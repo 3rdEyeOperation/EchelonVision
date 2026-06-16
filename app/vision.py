@@ -184,6 +184,7 @@ class VisionEngine:
         self._rknn_runtime_available: bool | None = None
         self._rknn_model = None
         self._status_note: str | None = None
+        self._last_bbox_trace: dict[str, Any] = {}
 
         self.runtime = RuntimeOptions(
             camera_source=settings.camera_source,
@@ -205,6 +206,14 @@ class VisionEngine:
 
     def _bootstrap_default_model(self) -> None:
         preferred = self.settings.yolo_model
+        default_model_hint = self.settings.models_dir / ".default_model"
+        if (not preferred or preferred == "yolov8n.pt") and default_model_hint.exists():
+            try:
+                hinted = default_model_hint.read_text(encoding="utf-8").strip()
+                if hinted:
+                    preferred = hinted
+            except Exception:
+                pass
         model_candidates = self.list_models()
 
         if preferred:
@@ -431,9 +440,19 @@ class VisionEngine:
 
         annotated = frame.copy()
         detections: list[Detection] = []
+        bbox_trace: dict[str, Any] = {
+            "model_format": active_format,
+            "model": self._active_model_name,
+            "conf": runtime.confidence,
+            "iou": runtime.iou,
+            "image_size": runtime.image_size,
+            "enabled_classes_count": len(runtime.enabled_classes),
+            "labels_count": len(labels),
+        }
 
         if active_format == "rknn" and rknn_model is not None:
-            obj_detections = self._predict_rknn(rknn_model, frame, labels, runtime)
+            obj_detections, rknn_trace = self._predict_rknn(rknn_model, frame, labels, runtime)
+            bbox_trace.update(rknn_trace)
             for detection in obj_detections:
                 if runtime.enabled_classes and len(runtime.enabled_classes) < len(labels) and detection.class_name not in runtime.enabled_classes:
                     continue
@@ -449,8 +468,11 @@ class VisionEngine:
         elif model is not None:
             if runtime.sahi_enabled and self._can_use_sahi():
                 obj_detections = self._predict_with_sahi(frame, runtime)
+                bbox_trace["decode_strategy"] = "sahi"
             else:
                 obj_detections = self._predict_direct(model, frame, labels, runtime)
+                bbox_trace["decode_strategy"] = "direct"
+            bbox_trace["raw_detections"] = len(obj_detections)
 
             for detection in obj_detections:
                 if runtime.enabled_classes and len(runtime.enabled_classes) < len(labels) and detection.class_name not in runtime.enabled_classes:
@@ -477,7 +499,12 @@ class VisionEngine:
                 runtime.bbox_opacity,
             )
 
+        bbox_trace["total_detections_drawn"] = len(detections)
+        self._last_bbox_trace = bbox_trace
         return annotated, detections
+
+    def get_bbox_trace(self) -> dict[str, Any]:
+        return dict(self._last_bbox_trace)
 
     def _predict_direct(
         self,
@@ -522,14 +549,24 @@ class VisionEngine:
         frame: np.ndarray,
         labels: dict[int, str],
         runtime: RuntimeOptions,
-    ) -> list[Detection]:
+    ) -> tuple[list[Detection], dict[str, Any]]:
         detections: list[Detection] = []
+        trace: dict[str, Any] = {
+            "decode_strategy": "rknn",
+            "variants_tried": 0,
+            "variant_results": [],
+            "raw_detections": 0,
+            "remapped_detections": 0,
+            "rknn_error": None,
+        }
         try:
             image_size = max(128, int(runtime.image_size))
             best_candidate: tuple[list[tuple[int, int, int, int]], list[float], list[int], float, float, float] | None = None
             best_candidate_count = 0
 
-            for input_tensor, ratio, dw, dh in self._rknn_input_variants(frame, image_size):
+            for variant_idx, (input_tensor, ratio, dw, dh) in enumerate(self._rknn_input_variants(frame, image_size)):
+                trace["variants_tried"] += 1
+                variant_info: dict[str, Any] = {"variant": variant_idx, "input_shape": list(input_tensor.shape)}
                 outputs = runtime_model.inference(inputs=[input_tensor])
                 boxes, scores, class_ids = self._decode_rknn_outputs(
                     outputs or [],
@@ -537,11 +574,16 @@ class VisionEngine:
                     num_classes_hint=len(labels),
                     input_size=image_size,
                 )
+                variant_info["decoded_boxes"] = int(boxes.shape[0])
+                variant_info["output_shapes"] = [list(np.asarray(o).shape) for o in (outputs or [])]
                 if boxes.size == 0:
+                    trace["variant_results"].append(variant_info)
                     continue
 
                 keep_indices = self._nms_indices_numpy(boxes, scores, runtime.iou)
+                variant_info["after_nms"] = int(keep_indices.size)
                 if keep_indices.size == 0:
+                    trace["variant_results"].append(variant_info)
                     continue
 
                 candidate_boxes: list[tuple[int, int, int, int]] = []
@@ -566,14 +608,19 @@ class VisionEngine:
                     candidate_scores.append(float(scores[idx]))
                     candidate_class_ids.append(int(class_ids[idx]))
 
+                variant_info["remapped_boxes"] = len(candidate_boxes)
+                trace["variant_results"].append(variant_info)
                 if len(candidate_boxes) > best_candidate_count:
                     best_candidate_count = len(candidate_boxes)
                     best_candidate = (candidate_boxes, candidate_scores, candidate_class_ids, ratio, dw, dh)
 
             if best_candidate is None:
-                return detections
+                trace["raw_detections"] = 0
+                return detections, trace
 
             boxes_list, scores_list, class_ids_list, ratio, dw, dh = best_candidate
+            trace["raw_detections"] = len(boxes_list)
+            trace["remapped_detections"] = len(boxes_list)
 
             for (x1, y1, x2, y2), score, class_id_i in zip(boxes_list, scores_list, class_ids_list):
                 class_name = self._resolve_class_name(class_id_i, labels)
@@ -588,7 +635,8 @@ class VisionEngine:
                 )
         except Exception as exc:
             self._status_note = f"RKNN inference failed: {exc}"
-        return detections
+            trace["rknn_error"] = str(exc)
+        return detections, trace
 
     @staticmethod
     def _remap_rknn_box_to_frame(
@@ -616,13 +664,29 @@ class VisionEngine:
 
         inv_ratio = 1.0 / max(ratio, 1e-6)
         best_box: tuple[int, int, int, int] | None = None
-        best_area = 0
+        # Pick the interpretation with the smallest clipping fraction — that is, the one
+        # whose pre-clamp coordinates fit most naturally inside the frame.  The correct
+        # coordinate format (e.g. xyxy in model pixel space) should need very little or
+        # no clamping, while wrong formats (e.g. treating xyxy as xywh) will produce
+        # coordinates that extend far outside the frame.
+        best_clip_penalty = float("inf")
 
         for cx1, cy1, cx2, cy2 in candidates:
             rx1 = (cx1 - dw) * inv_ratio
             ry1 = (cy1 - dh) * inv_ratio
             rx2 = (cx2 - dw) * inv_ratio
             ry2 = (cy2 - dh) * inv_ratio
+
+            if rx2 <= rx1 or ry2 <= ry1:
+                continue
+
+            box_w = rx2 - rx1
+            box_h = ry2 - ry1
+
+            # Fraction of the box that lies outside the frame on each axis.
+            clip_x = max(0.0, -rx1) + max(0.0, rx2 - frame_width)
+            clip_y = max(0.0, -ry1) + max(0.0, ry2 - frame_height)
+            clip_penalty = clip_x / max(box_w, 1.0) + clip_y / max(box_h, 1.0)
 
             ix1 = max(0, min(int(round(rx1)), frame_width - 1))
             iy1 = max(0, min(int(round(ry1)), frame_height - 1))
@@ -632,9 +696,8 @@ class VisionEngine:
             if ix2 <= ix1 or iy2 <= iy1:
                 continue
 
-            area = (ix2 - ix1) * (iy2 - iy1)
-            if area > best_area:
-                best_area = area
+            if clip_penalty < best_clip_penalty:
+                best_clip_penalty = clip_penalty
                 best_box = (ix1, iy1, ix2, iy2)
 
         return best_box
@@ -1199,6 +1262,8 @@ class CameraWorker:
         self._frame_event = threading.Event()
         self._latest_jpeg: bytes | None = None
         self._latest_detections: list[Detection] = []
+        self._browser_frame: np.ndarray | None = None
+        self._browser_frame_ts: float = 0.0
         self._latest_status: dict[str, Any] = {
             "camera_open": False,
             "frame_count": 0,
@@ -1240,13 +1305,62 @@ class CameraWorker:
         with self._lock:
             return list(self._latest_detections)
 
+    def ingest_browser_frame(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._browser_frame = frame.copy()
+            self._browser_frame_ts = time.time()
+
+    def _get_browser_frame(self) -> tuple[np.ndarray | None, float]:
+        with self._lock:
+            if self._browser_frame is None:
+                return None, 0.0
+            return self._browser_frame.copy(), float(self._browser_frame_ts)
+
     def _run(self) -> None:
         frame_count = 0
         current_source = ""
+        last_browser_frame_ts = 0.0
 
         while not self._stopped.is_set():
             runtime = self.vision.get_runtime_snapshot()
             requested_source = str(runtime.get("camera_source") or self.settings.camera_source)
+
+            if requested_source.startswith("browser://"):
+                if self._capture is not None:
+                    self._capture.release()
+                    self._capture = None
+
+                browser_frame, browser_ts = self._get_browser_frame()
+                if browser_frame is None:
+                    self._store_placeholder("Waiting for browser camera frame...")
+                    time.sleep(0.2)
+                    continue
+                if browser_ts <= last_browser_frame_ts:
+                    time.sleep(0.01)
+                    continue
+
+                last_browser_frame_ts = browser_ts
+                annotated, detections = self.vision.annotate(browser_frame)
+                jpeg = self._encode_jpeg(annotated)
+                if jpeg is None:
+                    continue
+
+                frame_count += 1
+                with self._lock:
+                    self._latest_jpeg = jpeg
+                    self._latest_detections = detections
+                    self._latest_status.update(
+                        {
+                            "camera_open": True,
+                            "frame_count": frame_count,
+                            "last_error": None,
+                            "width": int(browser_frame.shape[1]),
+                            "height": int(browser_frame.shape[0]),
+                        }
+                    )
+                self._frame_event.set()
+                time.sleep(max(1.0 / max(self.settings.camera_fps, 1), 0.01))
+                continue
 
             if requested_source != current_source or self._capture is None or not self._capture.isOpened():
                 if self._capture is not None:
@@ -1254,6 +1368,7 @@ class CameraWorker:
                 self._capture = self._open_capture(requested_source)
                 current_source = requested_source
                 frame_count = 0
+                last_browser_frame_ts = 0.0
 
                 if self._capture is None:
                     self._store_placeholder(f"Camera unavailable: {requested_source}")

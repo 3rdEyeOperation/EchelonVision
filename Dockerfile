@@ -30,10 +30,14 @@ RUN chmod 644 /usr/lib/librknnrt.so || true
 
 COPY app ./app
 COPY 3rdEchelonLogo.svg ./3rdEchelonLogo.svg
+COPY convert_model_to_json.py ./convert_model_to_json.py
+COPY model_bootstrap.py ./model_bootstrap.py
+COPY start.sh ./start.sh
 
 RUN mkdir -p /data/faces
 RUN mkdir -p /models
+RUN chmod +x /app/start.sh
 
 EXPOSE 3000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3000"]
+CMD ["/app/start.sh"]

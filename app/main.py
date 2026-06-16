@@ -5,7 +5,9 @@ import time
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -146,6 +148,20 @@ def update_enabled_classes(payload: ClassFilterPayload) -> JSONResponse:
     return JSONResponse({"ok": True, "enabled_classes": payload.enabled_classes})
 
 
+@app.post("/api/browser-frame")
+async def upload_browser_frame(frame: UploadFile = File(...)) -> JSONResponse:
+  payload = await frame.read()
+  if not payload:
+    raise HTTPException(status_code=400, detail="Empty frame payload")
+
+  decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+  if decoded is None:
+    raise HTTPException(status_code=400, detail="Invalid image payload")
+
+  camera_worker.ingest_browser_frame(decoded)
+  return JSONResponse({"ok": True, "width": int(decoded.shape[1]), "height": int(decoded.shape[0])})
+
+
 @app.get("/api/debug/rknn")
 def debug_rknn() -> JSONResponse:
     """Run one inference and return raw output shapes + decode trace."""
@@ -197,6 +213,21 @@ def debug_rknn() -> JSONResponse:
       )
     except Exception as exc:
         return JSONResponse({"error": str(exc)})
+
+
+@app.get("/api/debug/bbox-trace")
+def debug_bbox_trace() -> JSONResponse:
+    """Return a per-frame trace of the last annotate() call.
+
+    Useful for diagnosing why bounding boxes are not appearing in the stream:
+      - model_format        which backend ran (pt / onnx / rknn)
+      - decode_strategy     which decoder path was chosen
+      - variants_tried      how many input formats were tested (RKNN only)
+      - variant_results     per-variant decode/remap counts
+      - raw_detections      boxes that survived decoding + NMS + remap
+      - total_detections_drawn  boxes actually drawn on the frame (after class filter)
+    """
+    return JSONResponse(vision.get_bbox_trace())
 
 
 @app.get("/video.mjpg")
@@ -537,10 +568,14 @@ def _index_html() -> str:
         <div id="details" class="list small">Waiting for first frame...</div>
       </div>
       <div class="actions">
+        <button type="button" onclick="enablePhoneCameraMode()">Use This Phone Camera</button>
         <a class="button" href="/settings">Open Mission Settings</a>
       </div>
+      <div id="browser-status" class="list small" style="margin-top: 8px;">Phone camera source inactive.</div>
     </aside>
   </main>
+  <video id="browser-capture" autoplay muted playsinline style="display:none;"></video>
+  <canvas id="browser-canvas" style="display:none;"></canvas>
 <script>
 async function fetchJson(url, options) {
   const res = await fetch(url, options);
@@ -582,12 +617,113 @@ function syncClock() {
 document.addEventListener('fullscreenchange', syncFullscreenButton);
 document.addEventListener('DOMContentLoaded', syncFullscreenButton);
 
+const browserFeed = {
+  stream: null,
+  timer: null,
+  uploading: false
+};
+let runtimeCache = {};
+
+function setBrowserStatus(text) {
+  const node = document.getElementById('browser-status');
+  if (node) node.textContent = text;
+}
+
+function isBrowserSource(source) {
+  return String(source || '').startsWith('browser://');
+}
+
+async function startBrowserCameraUpload() {
+  if (browserFeed.stream) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setBrowserStatus('Browser camera API unavailable. Use a browser with camera support.');
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } },
+      audio: false
+    });
+    browserFeed.stream = stream;
+    const video = document.getElementById('browser-capture');
+    video.srcObject = stream;
+    await video.play();
+
+    browserFeed.timer = setInterval(pushBrowserFrame, 180);
+    setBrowserStatus('Phone camera connected. Uploading frames to server...');
+  } catch (err) {
+    setBrowserStatus('Camera permission failed: ' + (err.message || String(err)));
+  }
+}
+
+function stopBrowserCameraUpload() {
+  if (browserFeed.timer) {
+    clearInterval(browserFeed.timer);
+    browserFeed.timer = null;
+  }
+  if (browserFeed.stream) {
+    for (const track of browserFeed.stream.getTracks()) track.stop();
+    browserFeed.stream = null;
+  }
+}
+
+async function pushBrowserFrame() {
+  if (browserFeed.uploading) return;
+  const video = document.getElementById('browser-capture');
+  const canvas = document.getElementById('browser-canvas');
+  if (!video || !canvas || !video.videoWidth || !video.videoHeight) return;
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  browserFeed.uploading = true;
+  canvas.toBlob(async (blob) => {
+    try {
+      if (!blob) return;
+      const form = new FormData();
+      form.append('frame', blob, 'frame.jpg');
+      await fetch('/api/browser-frame', { method: 'POST', body: form });
+    } catch {
+      setBrowserStatus('Frame upload failed. Check network/API status.');
+    } finally {
+      browserFeed.uploading = false;
+    }
+  }, 'image/jpeg', 0.72);
+}
+
+async function syncBrowserMode() {
+  if (isBrowserSource(runtimeCache.camera_source)) {
+    await startBrowserCameraUpload();
+  } else {
+    stopBrowserCameraUpload();
+    setBrowserStatus('Phone camera source inactive. Set camera source to browser://webui to enable.');
+  }
+}
+
+async function enablePhoneCameraMode() {
+  try {
+    await fetchJson('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ camera_source: 'browser://webui' })
+    });
+    await refresh();
+  } catch (err) {
+    setBrowserStatus('Failed to enable phone camera source: ' + err.message);
+  }
+}
+
 async function refresh() {
   try {
     const [status, runtime] = await Promise.all([
       fetchJson('/api/status'),
       fetchJson('/api/settings')
     ]);
+    runtimeCache = runtime;
 
     document.getElementById('active-model').textContent = `Model: ${runtime.active_model || 'none'}`;
     document.getElementById('camera-source').textContent = `Source: ${runtime.camera_source || 'n/a'}`;
@@ -603,13 +739,16 @@ async function refresh() {
 
     const details = document.getElementById('details');
     if (!status.detections.length) {
-      details.innerHTML = '<div>No detections in current frame.</div>';
+      const note = runtime.status_note ? `<div>Status: ${runtime.status_note}</div>` : '';
+      details.innerHTML = `${note}<div>No detections in current frame.</div>`;
     } else {
       details.innerHTML = status.detections
         .slice(0, 16)
         .map((d) => `<div>• ${d.kind}:${d.class_name} (${d.confidence.toFixed(2)})</div>`)
         .join('');
     }
+
+    await syncBrowserMode();
 
   } catch {
     document.getElementById('camera-status').textContent = 'status unavailable';
@@ -744,7 +883,7 @@ def _settings_html() -> str:
   <section class=\"card\">
     <div class=\"grid\">
       <div class=\"field\">
-        <label>Camera Source (uvc://0, rtsp://..., rtmp://...)</label>
+        <label>Camera Source (uvc://0, rtsp://..., rtmp://..., browser://webui)</label>
         <input id=\"camera_source\" />
       </div>
       <div class=\"field\">
