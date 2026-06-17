@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -20,6 +21,8 @@ class Detection:
     confidence: float
     box: tuple[int, int, int, int]
     kind: str
+    track_id: int | None = None
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -29,13 +32,20 @@ class RuntimeOptions:
     iou: float
     image_size: int
     bbox_opacity: float
+    inference_mode: str = "auto"
+    mask_opacity: float = 0.25
+    show_bbox: bool = True
+    show_masks: bool = True
     enabled_classes: set[str] = field(default_factory=set)
+    tracking_enabled: bool = False
+    tracking_persist: bool = True
+    tracking_show_ids: bool = True
+    classification_topk: int = 3
     sahi_enabled: bool = False
     sahi_slice_height: int = 512
     sahi_slice_width: int = 512
     sahi_overlap_height_ratio: float = 0.2
     sahi_overlap_width_ratio: float = 0.2
-    alpr_enabled: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -155,6 +165,15 @@ class FaceAnalyzer:
             return None, best_score
         return best_name, best_score
 
+    def reload_gallery(self) -> int:
+        """Reload known face embeddings from faces_dir and return total identities loaded."""
+        try:
+            self.known_embeddings = self._load_gallery(self.settings.faces_dir)
+            return len(self.known_embeddings)
+        except Exception as exc:
+            self.error = str(exc)
+            return len(self.known_embeddings)
+
 
 class VisionEngine:
     SUPPORTED_SUFFIXES = {".pt", ".onnx", ".rknn"}
@@ -192,13 +211,18 @@ class VisionEngine:
             iou=settings.yolo_iou,
             image_size=settings.yolo_image_size,
             bbox_opacity=max(0.0, min(settings.bbox_opacity, 1.0)),
+            inference_mode="auto",
+            mask_opacity=0.25,
             enabled_classes=set(),
+            tracking_enabled=False,
+            tracking_persist=True,
+            tracking_show_ids=True,
+            classification_topk=3,
             sahi_enabled=settings.sahi_enabled,
             sahi_slice_height=settings.sahi_slice_height,
             sahi_slice_width=settings.sahi_slice_width,
             sahi_overlap_height_ratio=settings.sahi_overlap_height_ratio,
             sahi_overlap_width_ratio=settings.sahi_overlap_width_ratio,
-            alpr_enabled=settings.alpr_enabled,
         )
 
         self.settings.models_dir.mkdir(parents=True, exist_ok=True)
@@ -409,6 +433,15 @@ class VisionEngine:
                     continue
                 if key == "bbox_opacity":
                     value = max(0.0, min(float(value), 1.0))
+                elif key == "mask_opacity":
+                    value = max(0.0, min(float(value), 1.0))
+                elif key in ("show_bbox", "show_masks"):
+                    value = bool(value)
+                elif key == "classification_topk":
+                    value = max(1, min(int(value), 10))
+                elif key == "inference_mode":
+                    mode = str(value).strip().lower()
+                    value = mode if mode in {"auto", "detect", "segment", "pose", "track", "classify", "obb"} else "auto"
                 setattr(self.runtime, key, value)
 
     def get_runtime_snapshot(self) -> dict[str, Any]:
@@ -428,6 +461,14 @@ class VisionEngine:
                 }
             )
             return runtime
+
+    def reload_face_gallery(self) -> int:
+        """Reload face gallery to include recently uploaded reference photos."""
+        count = self.face_analyzer.reload_gallery()
+        with self._lock:
+            if self.face_analyzer.enabled:
+                self._status_note = f"Face gallery reloaded: {count} profiles"
+        return count
 
     def annotate(self, frame: np.ndarray) -> tuple[np.ndarray, list[Detection]]:
         with self._lock:
@@ -451,41 +492,51 @@ class VisionEngine:
         }
 
         if active_format == "rknn" and rknn_model is not None:
+            requested_mode = str(runtime.inference_mode or "auto").lower()
+            if requested_mode not in {"auto", "detect", "track"}:
+                self._status_note = f"Mode '{requested_mode}' is not implemented on RKNN yet. Using detect fallback."
             obj_detections, rknn_trace = self._predict_rknn(rknn_model, frame, labels, runtime)
             bbox_trace.update(rknn_trace)
             for detection in obj_detections:
                 if runtime.enabled_classes and len(runtime.enabled_classes) < len(labels) and detection.class_name not in runtime.enabled_classes:
                     continue
                 detections.append(detection)
-                self._draw_box(
-                    annotated,
-                    detection.box,
-                    f"object:{detection.class_name}",
-                    detection.confidence,
-                    self._color_for_label(detection.class_name),
-                    runtime.bbox_opacity,
-                )
+                if runtime.show_bbox:
+                    self._draw_box(
+                        annotated,
+                        detection.box,
+                        f"object:{detection.class_name}",
+                        detection.confidence,
+                        self._color_for_label(detection.class_name),
+                        runtime.bbox_opacity,
+                    )
         elif model is not None:
-            if runtime.sahi_enabled and self._can_use_sahi():
+            use_sahi = runtime.sahi_enabled and runtime.inference_mode in {"auto", "detect"}
+            if use_sahi and self._can_use_sahi():
                 obj_detections = self._predict_with_sahi(frame, runtime)
                 bbox_trace["decode_strategy"] = "sahi"
             else:
-                obj_detections = self._predict_direct(model, frame, labels, runtime)
-                bbox_trace["decode_strategy"] = "direct"
+                obj_detections, mode_used = self._predict_ultralytics_mode(model, frame, labels, runtime, annotated)
+                bbox_trace["decode_strategy"] = mode_used
             bbox_trace["raw_detections"] = len(obj_detections)
 
             for detection in obj_detections:
                 if runtime.enabled_classes and len(runtime.enabled_classes) < len(labels) and detection.class_name not in runtime.enabled_classes:
                     continue
                 detections.append(detection)
-                self._draw_box(
-                    annotated,
-                    detection.box,
-                    f"object:{detection.class_name}",
-                    detection.confidence,
-                    self._color_for_label(detection.class_name),
-                    runtime.bbox_opacity,
-                )
+                # Mode-aware painter may already render masks, keypoints, OBB, and labels.
+                if runtime.show_bbox and detection.kind in {"object", "track", "face", "obb"} and not detection.attributes.get("rendered"):
+                    caption = f"{detection.kind}:{detection.class_name}"
+                    if detection.track_id is not None and runtime.tracking_show_ids:
+                        caption = f"{caption}#{detection.track_id}"
+                    self._draw_box(
+                        annotated,
+                        detection.box,
+                        caption,
+                        detection.confidence,
+                        self._color_for_label(detection.class_name),
+                        runtime.bbox_opacity,
+                    )
 
         face_detections = self.face_analyzer.recognize(frame)
         for face in face_detections:
@@ -505,6 +556,154 @@ class VisionEngine:
 
     def get_bbox_trace(self) -> dict[str, Any]:
         return dict(self._last_bbox_trace)
+
+    def _predict_ultralytics_mode(
+        self,
+        model: Any,
+        frame: np.ndarray,
+        labels: dict[int, str],
+        runtime: RuntimeOptions,
+        annotated: np.ndarray,
+    ) -> tuple[list[Detection], str]:
+        detections: list[Detection] = []
+        requested_mode = str(runtime.inference_mode or "auto").lower()
+
+        call_mode = requested_mode
+        if requested_mode == "auto":
+            call_mode = "track" if runtime.tracking_enabled else "detect"
+
+        try:
+            if call_mode == "track":
+                results = model.track(
+                    source=frame,
+                    conf=runtime.confidence,
+                    iou=runtime.iou,
+                    imgsz=runtime.image_size,
+                    persist=bool(runtime.tracking_persist),
+                    verbose=False,
+                )
+            else:
+                results = model.predict(
+                    source=frame,
+                    conf=runtime.confidence,
+                    iou=runtime.iou,
+                    imgsz=runtime.image_size,
+                    verbose=False,
+                )
+        except Exception as exc:
+            self._status_note = f"{call_mode} inference failed: {exc}. Falling back to detect."
+            results = model.predict(
+                source=frame,
+                conf=runtime.confidence,
+                iou=runtime.iou,
+                imgsz=runtime.image_size,
+                verbose=False,
+            )
+            call_mode = "detect"
+
+        if not results:
+            return detections, call_mode
+
+        result = results[0]
+
+        if call_mode == "classify" and getattr(result, "probs", None) is not None:
+            topk = max(1, int(runtime.classification_topk))
+            probs = result.probs
+            indices = probs.top5[:topk] if hasattr(probs, "top5") else []
+            for idx in indices:
+                class_id = int(idx)
+                class_name = self._resolve_class_name(class_id, labels)
+                conf = float(probs.data[class_id]) if hasattr(probs, "data") else float(getattr(probs, "top1conf", 0.0))
+                box = (6, 6 + 28 * len(detections), max(120, frame.shape[1] // 3), 36 + 28 * len(detections))
+                det = Detection(
+                    label=class_name,
+                    class_name=class_name,
+                    confidence=conf,
+                    box=box,
+                    kind="classify",
+                    attributes={"rendered": True},
+                )
+                detections.append(det)
+                cv2.putText(
+                    annotated,
+                    f"classify:{class_name} {conf:.2f}",
+                    (10, 28 + 26 * (len(detections) - 1)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.72,
+                    (220, 220, 220),
+                    2,
+                    cv2.LINE_AA,
+                )
+            return detections, call_mode
+
+        if call_mode == "obb" and getattr(result, "obb", None) is not None and len(result.obb):
+            for idx in range(len(result.obb)):
+                conf = float(result.obb.conf[idx].item())
+                class_id = int(result.obb.cls[idx].item())
+                class_name = self._resolve_class_name(class_id, labels)
+                pts = result.obb.xyxyxyxy[idx].cpu().numpy().astype(np.int32)
+                xs = pts[:, 0]
+                ys = pts[:, 1]
+                box = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+                cv2.polylines(annotated, [pts.reshape(-1, 1, 2)], True, self._color_for_label(class_name), 2)
+                det = Detection(
+                    label=class_name,
+                    class_name=class_name,
+                    confidence=conf,
+                    box=box,
+                    kind="obb",
+                    attributes={"rendered": True, "polygon": pts.tolist()},
+                )
+                detections.append(det)
+            return detections, call_mode
+
+        if runtime.show_masks and getattr(result, "masks", None) is not None and result.masks is not None and result.masks.xy and call_mode in {"segment", "auto", "detect"}:
+            for poly in result.masks.xy:
+                if poly is None or len(poly) < 3:
+                    continue
+                pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+                overlay = annotated.copy()
+                cv2.fillPoly(overlay, [pts], (120, 190, 95))
+                cv2.addWeighted(overlay, runtime.mask_opacity, annotated, 1.0 - runtime.mask_opacity, 0.0, annotated)
+
+        keypoints = getattr(result, "keypoints", None)
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            return detections, call_mode
+
+        for i, box in enumerate(boxes):
+            xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
+            x1, y1, x2, y2 = xyxy
+            class_id = int(box.cls[0].item()) if hasattr(box, "cls") else 0
+            confidence = float(box.conf[0].item()) if hasattr(box, "conf") else 0.0
+            class_name = self._resolve_class_name(class_id, labels)
+
+            track_id = None
+            if hasattr(box, "id") and box.id is not None and len(box.id):
+                track_id = int(box.id[0].item())
+
+            det_kind = "track" if call_mode == "track" else "object"
+            attributes: dict[str, Any] = {}
+
+            if keypoints is not None and hasattr(keypoints, "xy") and i < len(keypoints.xy) and call_mode in {"pose", "auto"}:
+                kp = keypoints.xy[i].cpu().numpy().astype(np.int32)
+                for p in kp:
+                    cv2.circle(annotated, (int(p[0]), int(p[1])), 3, (70, 190, 210), -1)
+                attributes["keypoints"] = kp.tolist()
+
+            detections.append(
+                Detection(
+                    label=class_name,
+                    class_name=class_name,
+                    confidence=confidence,
+                    box=(x1, y1, x2, y2),
+                    kind=det_kind,
+                    track_id=track_id,
+                    attributes=attributes,
+                )
+            )
+
+        return detections, call_mode
 
     def _predict_direct(
         self,
@@ -1412,12 +1611,28 @@ class CameraWorker:
         source = source.strip()
         backend_v4l2 = cv2.CAP_V4L2 if hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
 
-        if source.startswith(("rtsp://", "rtmp://", "http://", "https://")):
-            cap = cv2.VideoCapture(source)
-            if cap.isOpened():
-                return cap
-            cap.release()
-            return None
+        # Handle RTSP, RTMP, and HTTP(S) streams without a blocking validation read.
+        # The capture loop will mark the source ready once the first frame arrives.
+        if source.startswith(("rtsp://", "rtmp://", "rtsps://", "rtmps://", "http://", "https://")):
+            prev_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;2500000|max_delay;500000|fflags;nobuffer"
+            try:
+                backend = cv2.CAP_FFMPEG if hasattr(cv2, "CAP_FFMPEG") else cv2.CAP_ANY
+                cap = cv2.VideoCapture(source, backend)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2500)
+                if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2500)
+                return cap if cap.isOpened() else None
+            except Exception as e:
+                print(f"Error opening streaming source {source}: {e}", flush=True)
+                return None
+            finally:
+                if prev_opts is None:
+                    os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                else:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prev_opts
 
         def _try_open(target: str | int, backend: int) -> cv2.VideoCapture | None:
             cap = cv2.VideoCapture(target, backend)
@@ -1450,6 +1665,9 @@ class CameraWorker:
             index = int(index_text) if index_text.isdigit() else 0
             open_targets.append(index)
             open_targets.append(f"/dev/video{index}")
+        elif source.startswith("browser://"):
+            # Browser camera source - handled separately by JS
+            return None
         elif source.isdigit():
             index = int(source)
             open_targets.append(index)
