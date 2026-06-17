@@ -67,6 +67,81 @@ python select_model.py --host http://127.0.0.1:3000 --select yolo26n.rknn
       1.jpg
 ```
 
+## RKNN Model Preparation
+
+### Part A — Acquire a `.rknn` file
+
+Use one of these paths:
+
+**Option 1: Export from an existing YOLO `.pt` model on a development machine** (most common)
+
+This requires `rknn-toolkit2` (full toolkit), not `rknn-toolkit-lite2` (lite2 is inference-only on device).
+
+First export `.pt` to `.onnx` with Ultralytics:
+
+```bash
+yolo export model=yolo11n.pt format=onnx imgsz=640
+```
+
+Then convert ONNX to RKNN:
+
+```python
+from rknn.api import RKNN
+
+rknn = RKNN()
+rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]], target_platform='rk3588')
+rknn.load_onnx(model='yolo11n.onnx')   # export .pt to .onnx first via ultralytics
+rknn.build(do_quantization=False)
+rknn.export_rknn('./models/yolo11n.rknn')
+rknn.release()
+```
+
+**Option 2: Download a pre-exported `.rknn` model**
+
+You can download from community sources such as Rockchip model zoo: `rockchip-linux/rknn_model_zoo`.
+Make sure the model target matches your NPU (`rk3588` for Banana Pi M7).
+
+### Part B — Generate the required `.rknn.classes.json` sidecar
+
+The `.rknn.classes.json` file is required. Without it, the model can load but detections may be silent or misclassified.
+It contains the class label index mapping used by the app.
+
+Use one of these methods (recommended order):
+
+```bash
+# If you have a labels .txt file (one class per line):
+python convert_model_to_json.py models/yolo11n.rknn --labels-file models/yolo11n.labels.txt -o models/yolo11n.rknn.classes.json
+
+# If a sibling .pt or .onnx is present (auto-extracts labels from the model):
+python convert_model_to_json.py models/yolo11n.rknn -o models/yolo11n.rknn.classes.json
+
+# Or write it manually — it's just a JSON index-to-name mapping:
+# models/yolo11n.rknn.classes.json
+```
+
+Example structure (COCO-style, truncated):
+
+```json
+{
+  "names": {
+    "0": "person",
+    "1": "bicycle",
+    "2": "car",
+    "...": "..."
+  }
+}
+```
+
+### Part C — Final expected folder state
+
+```text
+models/
+  yolo11n.rknn
+  yolo11n.rknn.classes.json
+```
+
+Both files must be present before starting the app.
+
 ## Run locally
 
 ```bash
@@ -106,6 +181,8 @@ pip install /path/to/rknn_toolkit_lite2-<version>-cp3x-cp3x-linux_aarch64.whl
 If RKNN runtime is not installed, `.rknn` models will appear in Settings but remain non-selectable.
 
 ### 4) Prepare model files
+
+See [RKNN Model Preparation](#rknn-model-preparation) above for how to obtain or export the `.rknn` file and generate the required sidecar.
 
 Put model files into `./models`, for example:
 
@@ -227,4 +304,3 @@ The compose setup maps:
 - `GET /api/debug/bbox-trace` last-frame bbox trace (decode/remap/draw pipeline)
 
 # EchelonVision
-
